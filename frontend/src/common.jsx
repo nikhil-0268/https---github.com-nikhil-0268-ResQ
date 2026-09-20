@@ -1,0 +1,10 @@
+import React,{createContext,useContext,useState} from 'react';
+import {MapPin,LocateFixed} from 'lucide-react';
+import MapView from './Map';
+export const Context=createContext();export const useApp=()=>useContext(Context);
+export const human=s=>s?.replaceAll('_',' ')||'not stated';
+export const age=t=>{const m=Math.max(0,Math.floor((Date.now()/1000-t)/60));return m<1?'just now':m<60?`${m}m ago`:`${Math.floor(m/60)}h ago`};
+export const time=t=>new Date(t*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+export function Badge({children,tone=''}){return <span className={'badge '+tone}>{children}</span>}
+export function Heading({eyebrow,title,description,children}){return <div className="page-heading"><div><div className="eyebrow">{eyebrow}</div><h1>{title}</h1><p>{description}</p></div><div className="heading-actions">{children}</div></div>}
+export function LocationPicker({value,onChange}){const {areas,t,notify,online}=useApp();async function gps(){if(!navigator.geolocation)return notify('Geolocation is unavailable');navigator.geolocation.getCurrentPosition(p=>onChange({lat:p.coords.latitude,lng:p.coords.longitude,source:'gps'}),()=>notify('Location unavailable. Choose an area or tap the map.'),{timeout:10000})}return <div className="location-picker"><div className="location-row"><select aria-label="Incident area" value={value?.area||''} onChange={e=>{const a=areas.find(a=>a.name===e.target.value);if(a)onChange({...a,area:a.name,source:'gazetteer'})}}><option value="">{t('Choose an area or tap the map','क्षेत्र छान्नुहोस् वा नक्सामा थिच्नुहोस्')}</option>{areas.map(a=><option key={a.name} value={a.name}>{a.name} · {a.ne}</option>)}</select><button type="button" className="secondary" onClick={gps}><LocateFixed size={16}/>{t('Use GPS','GPS')}</button></div><div className="picker-map"><MapView point={value} onPick={onChange} areas={areas}/></div><div className="coordinate-line"><MapPin size={13}/>{value?`${value.lat.toFixed(5)}, ${value.lng.toFixed(5)} · ${value.source}`:t('Location required · tap to place a pin','स्थान आवश्यक · पिन राख्नुहोस्')}{!online&&<span>Offline basemap may be limited</span>}</div></div>}
