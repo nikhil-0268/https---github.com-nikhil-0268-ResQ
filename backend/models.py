@@ -51,4 +51,31 @@ class Mutation(Base):
     __tablename__='mutations'
     id=Column(String,primary_key=True)
     response=Column(JSON,nullable=False)
+class Shelter(Base):
+    __tablename__='shelters'
+    id=Column(String,primary_key=True)
+    name=Column(String,nullable=False)
+    location=Column(String,nullable=False)
+    max_capacity=Column(Integer,nullable=False)
+    created_at=Column(Float,nullable=False)
+class Person(Base):
+    __tablename__='people'
+    id=Column(String,primary_key=True)
+    full_name=Column(String,nullable=False)
+    age=Column(Integer,nullable=True)
+    status=Column(String,nullable=False)
+    shelter_id=Column(String,ForeignKey('shelters.id'),nullable=True,index=True)
+    created_at=Column(Float,nullable=False)
+    updated_at=Column(Float,nullable=False)
+    version=Column(Integer,nullable=False,default=1)
+class CheckIn(Base):
+    __tablename__='check_ins'
+    id=Column(String,primary_key=True)
+    person_id=Column(String,ForeignKey('people.id'),nullable=False,index=True)
+    shelter_id=Column(String,ForeignKey('shelters.id'),nullable=True)
+    previous_shelter_id=Column(String,ForeignKey('shelters.id'),nullable=True)
+    status=Column(String,nullable=False)
+    actor=Column(String,nullable=False)
+    note=Column(String,nullable=False,default='')
+    created_at=Column(Float,nullable=False)
 Base.metadata.create_all(engine)

@@ -25,7 +25,7 @@ def sensor(kind,value,**kw):return client.post('/api/sensors',headers=H,json={'a
 def report_fixture(kind='other',rejected=False):return dict(incident_type=kind,verification_status='rejected' if rejected else 'unreviewed')
 def audio_fixture(repeat=False,false=False):return dict(human_type=True,repeated_signal=repeat,review_status='false_alarm' if false else 'unreviewed')
 @pytest.mark.parametrize('reports,audio,env,score',[
-([],[],{},0),([report_fixture()],[],{},2),([report_fixture('building_collapse')],[],{},5),([report_fixture('building_collapse')]*3,[],{},9),([], [audio_fixture()],{},3),([],[audio_fixture(True)],{},8),([report_fixture('building_collapse')]*3,[audio_fixture(True)],{},21),([report_fixture('building_collapse')],[],{'temperature':22},5),([report_fixture('building_collapse')],[],{'temperature':5},5),([report_fixture('building_collapse')],[],{'temperature':-5},7),([report_fixture()]*10,[audio_fixture(True)]*10,{'temperature':-1},32),([report_fixture('building_collapse',True)],[audio_fixture(True,True)],{},0)])
+([],[],{},0),([report_fixture()],[],{},2),([report_fixture('building_collapse')],[],{},5),([report_fixture('building_collapse')]*3,[],{},9),([], [audio_fixture()],{},3),([],[audio_fixture(True)],{},8),([report_fixture('building_collapse')]*3,[audio_fixture(True)],{},21),([report_fixture('building_collapse')],[],{'temperature':22},5),([report_fixture('building_collapse')],[],{'temperature':5},5),([report_fixture('building_collapse')],[],{'temperature':-5},5),([report_fixture()]*10,[audio_fixture(True)]*10,{'temperature':-1},30),([report_fixture('building_collapse',True)],[audio_fixture(True,True)],{},0)])
 def test_score(reports,audio,env,score):assert calculate(reports,audio,env)['score']==score
 @pytest.mark.parametrize('kind,value,expected',[('temperature',20,'low'),('temperature',10,'medium'),('temperature',0,'high'),('temperature',-1,'critical'),('rainfall',1,'low'),('rainfall',2,'medium'),('rainfall',5,'high'),('rainfall',10,'high'),('rainfall',10.1,'critical'),('landslide_assessment',3,'high')])
 def test_thresholds(kind,value,expected):assert risk(kind,value)==expected
@@ -40,7 +40,7 @@ def test_prompt_injection_and_unknowns():
 def test_auth_privacy_and_original_preservation():
     message='  घर भत्किएको छ  ';p=post(message,phone='private-number');assert 'phone' not in str(p)
     assert client.get('/api/incidents').status_code==401
-    assert client.get('/api/environmental').status_code==401
+    assert client.get('/api/environmental').status_code==404
     assert client.post('/api/auth/check',json={'code':'wrong'}).status_code==401
     i=listing()[0];d=client.get('/api/incidents/'+i['id'],headers=H).json();r=d['reports'][0]
     assert r['original_message']==message;assert r['contact_phone']=='private-number';assert r['extraction_status']=='failed';assert r['extraction_method']=='rules_fallback'
@@ -108,17 +108,13 @@ def test_invalid_audio():
     for content in (b'fake audio',wav(31)):
         r=client.post('/api/audio',headers=H,data={'actor':'Tester','lat':27.6,'lng':85.3},files={'file':('clip.wav',content,'audio/wav')});assert r.status_code==422
 
-def test_environment_context_and_staleness():
-    post();assert sensor('temperature',-5).status_code==200;assert listing()[0]['score']==7
-    assert sensor('rainfall',12).status_code==200;assert sensor('landslide_assessment',3).status_code==200
-    i=listing()[0];assert i['score']==7;assert i['has_hazard'];assert i['environmental_context']['landslide_risk']=='high'
-    als=client.get('/api/alerts',headers=H).json();assert len([a for a in als if a['kind']=='environment'])==3
-    assert all(a['ne'] for a in als)
-    assert sensor('temperature',25).status_code==200;assert listing()[0]['score']==5
-    assert sensor('temperature',-10,observed_at=time.time()-20000).status_code==200;assert listing()[0]['score']==5
-    assert sensor('rainfall',-1).status_code==422
-    assert sensor('landslide_assessment',2.5).status_code==422
-    assert sensor('temperature',20,observed_at=time.time()+1000).status_code==422
+def test_environment_monitoring_retired():
+    post()
+    assert sensor('temperature',-5).status_code==404
+    assert client.get('/api/environmental',headers=H).status_code==404
+    assert listing()[0]['score']==5
+    assert not any('cold' in k for k in listing()[0]['breakdown'])
+
 
 def test_priority_override_and_seed_reset_preserves_real():
     assert client.post('/api/demo/seed',headers=H).status_code==200
@@ -139,7 +135,7 @@ def test_concurrent_dashboard_requests():
     import asyncio,httpx
     async def run():
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://test',headers=H) as c:
-            responses=await asyncio.wait_for(asyncio.gather(*(c.get(p) for p in ['/api/incidents','/api/environmental','/api/alerts','/api/heat','/api/reports/unlocated'])),timeout=5)
+            responses=await asyncio.wait_for(asyncio.gather(*(c.get(p) for p in ['/api/incidents','/api/registry','/api/alerts','/api/heat','/api/reports/unlocated'])),timeout=5)
             assert all(r.status_code==200 for r in responses)
     asyncio.run(run())
 
@@ -152,3 +148,88 @@ def test_parallel_duplicate_submission_is_single_report():
             assert all(r.status_code==200 for r in responses)
             assert responses[0].json()['id']==responses[1].json()['id']
     asyncio.run(run());assert listing()[0]['report_count']==1
+
+def registry_post(path,**body):
+    return client.post('/api/'+path,headers=H,json={'actor':'Test Responder','client_id':uuid.uuid4().hex,**body})
+def site(capacity=2):
+    r=registry_post('shelters',id='S-'+str(uuid.uuid4()).upper(),name='TEST Shelter',location='TEST Location',max_capacity=capacity)
+    assert r.status_code==200,r.text
+    return r.json()['id']
+def person(sid=None,**kw):
+    r=registry_post('people',id='P-'+str(uuid.uuid4()).upper(),full_name='TEST Person',status='in_shelter' if sid else 'safe',shelter_id=sid,**kw)
+    assert r.status_code==200,r.text
+    return r.json()
+def checkin(p,sid=None,status='safe',**kw):
+    return client.patch('/api/people/'+p['id']+'/check-in',headers=H,json={'actor':'Test Responder','client_id':uuid.uuid4().hex,'expected_version':p['version'],'status':status,'shelter_id':sid,**kw})
+def registry():return client.get('/api/registry',headers=H).json()
+
+def test_registration_auth_and_validation():
+    assert client.get('/api/registry').status_code==401
+    assert client.post('/api/people',json={}).status_code==401
+    assert registry_post('people',id='bad',full_name='  ').status_code==422
+    assert registry_post('shelters',id='S-'+str(uuid.uuid4()),name='Site',location='Here',max_capacity=0).status_code==422
+    assert registry()['counts']['registered']==0
+
+def test_person_retry_and_repeated_checkin_do_not_double_count():
+    sid=site();pid='P-'+str(uuid.uuid4()).upper()
+    body=dict(id=pid,full_name='TEST Person',age=12,status='in_shelter',shelter_id=sid,client_id='stable-registration')
+    for _ in range(2):assert registry_post('people',**body).status_code==200
+    p=registry()['people'][0]
+    for _ in range(3):assert checkin(p,sid,'in_shelter').json()['version']==1
+    assert registry()['shelters'][0]['current_count']==1
+    assert len(registry()['people'])==1
+    assert len(client.get('/api/people/'+pid+'/history',headers=H).json())==1
+
+def test_relocation_missing_checkout_and_audit():
+    first,second=site(),site();p=person(first)
+    r=checkin(p,second,'relocated',client_id='move-once');assert r.status_code==200
+    # Lost response retry remains successful even with an old expected version.
+    assert checkin(p,second,'relocated',client_id='move-once').json()==r.json()
+    counts={s['id']:s['current_count'] for s in registry()['shelters']};assert counts=={first:0,second:1}
+    p=r.json();assert checkin(p,second,'missing').status_code==422
+    r=checkin(p,None,'missing');assert r.status_code==200
+    assert registry()['counts']['at_sites']==0
+    assert registry()['counts']['missing']==1
+    history=client.get('/api/people/'+p['id']+'/history',headers=H).json()
+    assert len(history)==3;assert history[0]['previous_shelter_id']==second
+
+def test_capacity_and_stale_offline_updates():
+    sid=site(1);p=person(sid);other=person()
+    assert checkin(other,sid,'in_shelter').status_code==409
+    assert checkin(p,sid,'needs_medical').status_code==200
+    assert checkin(p,None,'safe').status_code==409
+    state=registry();assert state['counts']['at_sites']==1;assert state['counts']['needs_medical']==1
+    assert checkin(other,None,'in_shelter').status_code==422
+
+def test_new_unknown_report_receipt_and_alert():
+    result=post('Please send somebody to check this place',lat=27.721,lng=85.361)
+    assert client.get('/api/reports/'+result['id']+'/receipt').status_code==401
+    receipt=client.get('/api/reports/'+result['id']+'/receipt',headers=H).json()
+    assert receipt['incident_id'] in [i['id'] for i in listing()]
+    assert any(a['incident_id']==receipt['incident_id'] for a in client.get('/api/alerts',headers=H).json())
+
+
+def test_sos_receipt_privacy_priority_and_retry():
+    body={'client_id':str(uuid.uuid4()),'lat':27.1234567,'lng':85.7654321,'timestamp':time.time(),'emergency_status':'sos','location_source':'gps','accuracy':12}
+    r=client.post('/api/sos',json=body);assert r.status_code==200,r.text
+    assert r.json()['received'];assert 'lat' not in r.json();assert 'incident_id' not in r.json()
+    assert client.post('/api/sos',json=body).json()==r.json()
+    assert len(listing())==1
+    i=listing()[0];assert i['is_sos'];assert i['priority']=='high';assert i['rescue_priority']==1
+    assert i['lat']==body['lat'];assert i['lng']==body['lng']
+    assert client.get('/api/incidents/'+i['id']).status_code==401
+    d=client.get('/api/incidents/'+i['id'],headers=H).json();assert d['sos']['emergency_status']=='sos';assert d['sos']['client_timestamp']==body['timestamp']
+    assert any(a['kind']=='sos' for a in client.get('/api/alerts',headers=H).json())
+    # A separate nearby report must not shift the precise SOS coordinates.
+    post(lat=body['lat']+.0001,lng=body['lng']);assert len(listing())==2
+    assert next(x for x in listing() if x['is_sos'])['lat']==body['lat']
+
+def test_sos_location_validation_and_rate_limit():
+    body={'client_id':str(uuid.uuid4()),'lat':91,'lng':85,'timestamp':time.time(),'emergency_status':'sos','location_source':'manual'}
+    assert client.post('/api/sos',json=body).status_code==422
+    body['lat']=27
+    for _ in range(5):
+        body['client_id']=str(uuid.uuid4());assert client.post('/api/sos',json=body).status_code==200
+    # Retrying an existing ID works even at the limit.
+    assert client.post('/api/sos',json=body).status_code==200
+    body['client_id']=str(uuid.uuid4());assert client.post('/api/sos',json=body).status_code==429

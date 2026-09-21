@@ -8,20 +8,38 @@ export const pending=()=>operation('queue','readonly',s=>s.getAll());
 export const removePending=id=>operation('queue','readwrite',s=>s.delete(id));
 export function credentials(){try{return JSON.parse(sessionStorage.getItem('resq-session'))}catch{return null}}
 export async function api(path,options={}){
- const session=credentials();const headers={...options.headers}; if(session)headers['X-Responder-Code']=session.code;
- if(options.body && !(options.body instanceof FormData))headers['Content-Type']='application/json';
+ const session=credentials();const headers={...options.headers};if(session)headers['X-Responder-Code']=session.code;
+ if(options.body&&!(options.body instanceof FormData))headers['Content-Type']='application/json';
  let response;try{response=await fetch('/api'+path,{...options,headers,signal:AbortSignal.timeout(45000)})}catch(e){e.network=true;throw e}
- if(!response.ok){let body;try{body=await response.json()}catch{};const e=new Error(typeof body?.detail==='string'?body.detail:JSON.stringify(body?.detail||'Request failed'));e.status=response.status;e.retryable=response.status>=500||response.status===429;throw e}
+ if(!response.ok){let body;try{body=await response.json()}catch{}const e=new Error(typeof body?.detail==='string'?body.detail:JSON.stringify(body?.detail||'Request failed'));e.status=response.status;e.retryable=response.status>=500||response.status===429;throw e}
  return options.blob?response.blob():response.json();
 }
-export async function mutate(path,body,method='POST'){
- const id=crypto.randomUUID();const isForm=body instanceof FormData;
- if(isForm)body.set('client_id',id);else body={...body,client_id:id};
- const item={id,path,method,form:isForm,body:isForm?[...body.entries()]:body,owner:path==='/reports'?null:credentials()?.name,created:Date.now()};
- await operation('queue','readwrite',s=>s.put(item));
- try{const result=await send(item);await removePending(id);return result}catch(e){if(e.network||e.retryable)return {queued:true};await removePending(id);throw e}
-}
-function send(item){return api(item.path,{method:item.method,body:item.form?toForm(item.body):JSON.stringify(item.body)})}
 function toForm(entries){const body=new FormData();entries.forEach(([k,v])=>body.append(k,v));return body}
-let syncing=false;
-export async function sync(){if(syncing)return;syncing=true;try{for(const item of (await pending()).sort((a,b)=>a.created-b.created)){if(item.owner && credentials()?.name!==item.owner)continue;try{await send(item);await removePending(item.id)}catch(e){if(e.network||e.retryable)break;throw new Error('Saved change needs attention: '+e.message)}}}finally{syncing=false}}
+function send(item){return api(item.path,{method:item.method,body:item.form?toForm(item.body):JSON.stringify(item.body)})}
+const results=new Map();
+let syncJob=null;
+function entity(item){if(item.path==='/people'||item.path==='/shelters')return item.body.id;return item.path.match(/^\/people\/([^/]+)/)?.[1]||item.id}
+export async function sync(){
+ if(syncJob)return syncJob;
+ syncJob=(async()=>{const blocked=new Set();for(const item of (await pending()).sort((a,b)=>a.created-b.created)){
+  if(item.owner&&credentials()?.name!==item.owner)continue;
+  const key=entity(item);if(blocked.has(key)||blocked.has(item.body?.shelter_id))continue;
+  try{const result=await send(item);results.set(item.id,result);if(results.size>200)results.delete(results.keys().next().value);await removePending(item.id)}catch(e){
+   if(e.network||e.retryable)break;
+   blocked.add(key);await operation('queue','readwrite',s=>s.put({...item,error:e.message,error_status:e.status}));
+  }
+ }})();try{await syncJob}finally{syncJob=null}
+}
+export async function mutate(path,body,method='POST'){
+ const id=crypto.randomUUID(),form=body instanceof FormData;
+ if(form)body.set('client_id',id);else body={...body,client_id:id};
+ const item={id,path,method,form,body:form?[...body.entries()]:body,owner:path==='/reports'?null:credentials()?.name,created:Date.now()};
+ await operation('queue','readwrite',s=>s.put(item));
+ await sync();
+ // A poll may have captured its queue before this item was inserted.
+ if(!results.has(id))await sync();
+ if(results.has(id)){const result=results.get(id);results.delete(id);return result}
+ const saved=(await pending()).find(x=>x.id===id);
+ if(saved?.error){const e=new Error(saved.error);e.status=saved.error_status;e.pendingId=id;throw e}
+ return {queued:true,pending_id:id};
+}

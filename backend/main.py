@@ -11,8 +11,9 @@ from sqlalchemy import select
 from .models import Session, Incident, Report, Audio, Environment, Log, Alert, Mutation, DATA
 from .scoring import distance, risk, calculate, rank, OPEN, SEARCH
 from .extraction import extract
+from .registration import router as registration_router
 
-app=FastAPI(title='ResQ',version='1.0.0')
+app=FastAPI(title='ResQ',version='1.1.0')
 CODE=os.getenv('RESPONDER_CODE','resq-demo')
 AREAS=json.loads((Path(__file__).parent/'gazetteer.json').read_text(encoding='utf-8-sig'))
 LOCK=threading.RLock()
@@ -63,6 +64,7 @@ def group(s,lat,lng,kind,audio=False):
     if lat is None: return None
     now=time.time(); candidates=[]; previous=None
     for i in s.scalars(select(Incident)):
+        if i.kind=="sos": continue  # Preserve the exact SOS location; never merge other signals.
         d=distance((lat,lng),(i.lat,i.lng))
         if d>100: continue
         if i.status not in OPEN: previous=i.id; continue
@@ -92,8 +94,13 @@ def context(s,i):
 
 def serialize(s,i,detail=False):
     rs,aus=rows(s,Report,i.id),rows(s,Audio,i.id)
-    env,es=context(s,i)
+    env,es=dict(temperature=None,temperature_risk=None,rainfall_mm_per_hour=None,landslide_risk=None,is_simulated=False),[]
     result=dict(id=i.id,lat=i.lat,lng=i.lng,place_name=place(i.lat,i.lng),primary_type=i.kind,status=i.status,status_by=i.status_by,status_at=i.status_at,created_at=i.created_at,last_signal_at=i.last_signal_at,manual_priority=i.manual_priority,override_at=i.override_at,override_by=i.override_by,previous_incident_id=i.previous_incident_id,environmental_context=env,is_simulated=any(r['is_simulated'] for r in rs+aus+es),**calculate(rs,aus,env))
+    result['is_sos']=i.kind=='sos'
+    if i.kind=='sos':
+        result['sos']=next((r for r in rs if r.get('emergency_status')=='sos'),None)
+        if any(r['verification_status']!='rejected' for r in rs):
+            result.update(priority='high',score=15,breakdown={'Explicit SOS request — urgent human review':15},is_search_relevant=True)
     result['has_hazard']=env['landslide_risk']=='high' or (env['temperature'] is not None and env['temperature']<0) or (env['rainfall_mm_per_hour'] or 0)>10
     if detail:
         for a in aus: a.pop('file_path',None)
@@ -103,9 +110,8 @@ def serialize(s,i,detail=False):
 
 def emit_incident(s,i,kind='report'):
     s.flush(); d=serialize(s,i)
-    if d['priority'] in ('high','medium'):
-        alert(s,i.id,kind,f"{d['priority'].upper()} · {d['place_name']}. Review evidence.",f"{ 'उच्च' if d['priority']=='high' else 'मध्यम'} प्राथमिकता · {d['place_name']}। विवरण जाँच गर्नुहोस्।",d['is_simulated'])
-    if d['environmental_context']['landslide_risk']=='high': alert(s,i.id,'landslide','Report in a high landslide risk zone. Assess slope safety.','उच्च पहिरो जोखिम क्षेत्रमा रिपोर्ट। ढलानको सुरक्षा जाँच गर्नुहोस्।',d['is_simulated'])
+    if True:  # All reports, including unclassified signals, produce a visible alert.
+        alert(s,i.id,kind,f"{d['priority'].upper()} · {d['place_name']}. Review evidence.",f"{ {'high':'उच्च','medium':'मध्यम','low':'नयाँ रिपोर्ट'}[d['priority']]} प्राथमिकता · {d['place_name']}। विवरण जाँच गर्नुहोस्।",d['is_simulated'])
 
 class Login(BaseModel):
     code: str
@@ -114,7 +120,7 @@ def login(body:Login):
     if not secrets.compare_digest(body.code,CODE): raise HTTPException(401,'Incorrect responder code')
     return {'ok':True,'demo_code':CODE=='resq-demo'}
 @app.get('/api/config')
-def config(): return dict(emergency_numbers=os.getenv('EMERGENCY_NUMBERS_TEXT','Nepal Police: 100 · Ambulance Nepal: 102. Published official contacts checked 20 September 2026; local availability may vary.'),extraction='claude' if os.getenv('ANTHROPIC_API_KEY') else 'rules_fallback',audio_mode='manual_review',weather='manual input',demo_code=CODE=='resq-demo')
+def config(): return dict(emergency_numbers=os.getenv('EMERGENCY_NUMBERS_TEXT','Nepal Police: 100 · Ambulance Nepal: 102. Published official contacts checked 20 September 2026; local availability may vary.'),extraction='claude' if os.getenv('ANTHROPIC_API_KEY') else 'rules_fallback',audio_mode='manual_review',registration=True,demo_code=CODE=='resq-demo')
 @app.get('/api/gazetteer')
 def gazetteer(): return AREAS
 @app.get('/api/health')
@@ -128,7 +134,7 @@ def report(request:Request,message:str=Form(min_length=3,max_length=5000),lat:fl
     if len(q)>=10: raise HTTPException(429,'Too many reports. Retry after one minute.')
     q.append(now)
     lat,lng=location(lat,lng,area)
-    rid=uid('r'); photo_path=None
+    rid=('r-'+uuid.uuid5(uuid.NAMESPACE_URL,'resq:'+client_id).hex) if client_id else uid('r'); photo_path=None
     if photo:
         raw=photo.file.read(5*1024*1024+1)
         if len(raw)>5*1024*1024: raise HTTPException(413,'Photo must be at most 5 MB')
@@ -136,7 +142,7 @@ def report(request:Request,message:str=Form(min_length=3,max_length=5000),lat:fl
         if not ext: raise HTTPException(422,'Upload a JPEG or PNG photo')
         photo_path=str(DATA/(rid+ext)); Path(photo_path).write_bytes(raw)
     # Persist original BEFORE external extraction, including on model failure.
-    r=Report(id=rid,payload=dict(original_message=message,contact_phone=phone or None,photo_path=photo_path,has_photo=bool(photo_path),created_at=now,is_simulated=False,verification_status='unreviewed',extraction_status='failed',lat=lat,lng=lng,incident_type='unknown'))
+    r=s.get(Report,rid) or Report(id=rid,payload=dict(original_message=message,contact_phone=phone or None,photo_path=photo_path,has_photo=bool(photo_path),created_at=now,is_simulated=False,verification_status='unreviewed',extraction_status='failed',lat=lat,lng=lng,incident_type='unknown'))
     s.add(r); s.commit()
     data,status,method,error=extract(message)
     if lat is None:
@@ -149,6 +155,34 @@ def report(request:Request,message:str=Form(min_length=3,max_length=5000),lat:fl
     if i: centroid(s,i); emit_incident(s,i)
     response={'id':rid,'received':True,'message':'Report received. A responder will review it.'}
     if client_id: s.add(Mutation(id='report:'+client_id,response=response))
+    return response
+
+class SOSInput(BaseModel):
+    client_id:uuid.UUID
+    lat:float=Field(ge=-90,le=90,allow_inf_nan=False)
+    lng:float=Field(ge=-180,le=180,allow_inf_nan=False)
+    timestamp:float=Field(gt=0,allow_inf_nan=False)
+    emergency_status:Literal['sos']
+    location_source:Literal['gps','pin','gazetteer','manual']
+    accuracy:float|None=Field(default=None,ge=0,allow_inf_nan=False)
+
+@app.post('/api/sos')
+def send_sos(b:SOSInput,request:Request,s=Depends(db,scope='function')):
+    key='sos:'+str(b.client_id)
+    if old:=s.get(Mutation,key): return old.response
+    now=time.time()
+    if b.timestamp>now+300: raise HTTPException(422,'Device timestamp is in the future. Check your clock.')
+    rate_key='sos:'+(request.client.host if request.client else 'local'); q=RATE[rate_key]
+    while q and q[0]<now-60:q.popleft()
+    if len(q)>=5:raise HTTPException(429,'Too many SOS requests. Wait one minute before trying again.')
+    q.append(now)
+    i=Incident(id=uid('i'),lat=b.lat,lng=b.lng,kind='sos',status='pending',status_by='system',status_at=now,created_at=now,last_signal_at=now)
+    s.add(i);s.flush()
+    r=Report(id=uid('sos'),incident_id=i.id,payload=dict(original_message='Emergency SOS — immediate assistance requested.',language='not_stated',incident_type='sos',emergency_status='sos',lat=b.lat,lng=b.lng,location_source=b.location_source,accuracy=b.accuracy,client_timestamp=b.timestamp,created_at=now,is_simulated=False,verification_status='unreviewed',extraction_status='not_applicable',extraction_method='direct_sos',extraction_error=None,has_photo=False,contact_phone=None,trapped_people=None,injured_reported=None,severity='high',vehicle_count=None))
+    s.add(r);log(s,i.id,'sos_received','Explicit SOS received. High priority pending responder verification. No dispatch initiated.')
+    alert(s,i.id,'sos','SOS · '+place(b.lat,b.lng)+' · urgent assistance requested.','SOS · तत्काल सहायता अनुरोध।')
+    response=dict(id=r.id,received=True,received_at=now)
+    s.add(Mutation(id=key,response=response))
     return response
 
 @app.get('/api/incidents',dependencies=[Depends(auth)])
@@ -290,44 +324,12 @@ def review(aid:str,b:Review,s=Depends(db, scope='function')):
     log(s,a.incident_id,'verification',f'Audio {aid}: {b.status}. {b.note}',b.actor)
     return done(s,b)
 
-class Sensor(Action):
-    event_type:Literal['temperature','rainfall','landslide_assessment']
-    value:float=Field(allow_inf_nan=False)
-    lat:float=Field(ge=-90,le=90); lng:float=Field(ge=-180,le=180)
-    observed_at:float|None=None
-    location_source:Literal['gps','pin','gazetteer','api']='pin'
-
-def add_sensor(s,b,sim=False):
-    if b.event_type=='temperature' and not -100<=b.value<=70: raise HTTPException(422,'Temperature must be -100 to 70°C')
-    if b.event_type=='rainfall' and not 0<=b.value<=1000: raise HTTPException(422,'Rainfall must be 0 to 1000 mm/h')
-    if b.event_type=='landslide_assessment' and b.value not in (1,2,3): raise HTTPException(422,'Risk must be 1, 2 or 3')
-    observed=b.observed_at if b.observed_at is not None else time.time()
-    if not math.isfinite(observed) or observed>time.time()+300 or observed<0: raise HTTPException(422,'Timestamp must be valid and not in the future')
-    candidates=[(distance((b.lat,b.lng),(i.lat,i.lng)),i) for i in s.scalars(select(Incident)) if i.status in OPEN]
-    nearest=min(candidates,key=lambda x:x[0]) if candidates else None
-    iid=nearest[1].id if nearest and nearest[0]<=10000 else None
-    level=risk(b.event_type,b.value)
-    payload=dict(event_type=b.event_type,value=b.value,lat=b.lat,lng=b.lng,risk_level=level,observed_at=observed,created_at=time.time(),source='manual',recorded_by=b.actor,location_source=b.location_source,is_simulated=sim,note=b.note)
-    e=Environment(id=uid('env'),incident_id=iid,payload=payload); s.add(e)
-    if time.time()-observed<=10800 and (level=='critical' or b.event_type=='landslide_assessment' and level=='high'):
-        text=f'{b.event_type.replace("_"," ").upper()} · {b.value} · {place(b.lat,b.lng)}. Check access and field conditions.'
-        ne=f'{ {"temperature":"तापक्रम", "rainfall":"वर्षा", "landslide_assessment":"पहिरो जोखिम"}[b.event_type]} · {b.value} · {place(b.lat,b.lng)}। क्षेत्रको अवस्था जाँच गर्नुहोस्।'
-        alert(s,iid,'environment',text,ne,sim); log(s,iid,'environmental_alert',text,b.actor)
-    return dict(id=e.id,incident_id=iid,**payload)
-@app.post('/api/sensors',dependencies=[Depends(auth)])
-def sensor(b:Sensor,s=Depends(db, scope='function')):
-    if old:=duplicate(s,b): return old.response
-    response=add_sensor(s,b)
-    if b.client_id: s.add(Mutation(id='action:'+b.client_id,response=response))
-    return response
-@app.get('/api/environmental',dependencies=[Depends(auth)])
-def environmental(s=Depends(db, scope='function')): return sorted(rows(s,Environment),key=lambda x:-x['observed_at'])
 @app.get('/api/heat',dependencies=[Depends(auth)])
 def heat(s=Depends(db, scope='function')):
     return [[r['lat'],r['lng'],{'high':1,'medium':.6,'low':.3}.get(r.get('severity'),.3)] for r in rows(s,Report) if r['lat'] is not None and r['verification_status']!='rejected']
 @app.get('/api/alerts',dependencies=[Depends(auth)])
 def alerts(after:float=0,s=Depends(db, scope='function')):
-    return sorted([a for a in rows(s,Alert) if a['created_at']>after],key=lambda x:-x['created_at'])[:100]
+    return sorted([a for a in rows(s,Alert) if a['created_at']>after and a['kind'] not in ('environment','landslide')],key=lambda x:-x['created_at'])[:100]
 
 @app.post('/api/demo/seed',dependencies=[Depends(auth)])
 def seed(s=Depends(db, scope='function')):
@@ -346,8 +348,6 @@ def seed(s=Depends(db, scope='function')):
         if index in (0,1):
             s.add(Audio(id=uid('a'),incident_id=i.id,payload=dict(label='TAPPING_KNOCKING' if index==0 else 'VOICE',human_type=True,repeated_signal=index==0,onset_count=4 if index==0 else None,lat=area['lat'],lng=area['lng'],recorded_by='Demo responder',mode='demo_label',review_status='unreviewed',is_simulated=True,created_at=time.time(),has_file=False,file_path=None,duration_s=None,note='SIMULATED label fixture; no model inference.')))
         emit_incident(s,i)
-    for index,kind,value in [(0,'temperature',-2),(1,'rainfall',12),(6,'landslide_assessment',3)]:
-        a=AREAS[index]; add_sensor(s,Sensor(actor='Demo sensor',event_type=kind,value=value,lat=a['lat'],lng=a['lng']),True)
     return {'ok':True,'reports':20}
 def extract_demo(message,kind):
     from .extraction import fallback
@@ -374,3 +374,10 @@ def reset(s=Depends(db, scope='function')):
             s.flush(); s.delete(i)
         else: centroid(s,i)
     return {'ok':True}
+
+@app.get('/api/reports/{rid}/receipt',dependencies=[Depends(auth)])
+def receipt(rid:str,s=Depends(db, scope='function')):
+    report=get(s,Report,rid)
+    return {'id':report.id,'incident_id':report.incident_id,'received':True}
+
+app.include_router(registration_router, dependencies=[Depends(auth)])
